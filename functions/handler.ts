@@ -5,9 +5,10 @@
  */
 import snapRaw from './scale_snapshot.json' with { type: 'json' };
 
-const SNAP = snapRaw as { generatedAt: string; source: string; dates: string[]; rows: [string, number, number][]; missing: number };
-const SCALE = new Map<string, { yi: number; date: string }>();
-for (const r of SNAP.rows) SCALE.set(r[0], { yi: r[1], date: SNAP.dates[r[2]] || '' });
+const SNAP = snapRaw as { generatedAt: string; source: string; dates: string[]; rows: [string, number | null, number, number | null, number | null][]; missing: number };
+type SnapBase = { yi: number | null; date: string; buy: number | null; buyOrig: number | null };
+const SCALE = new Map<string, SnapBase>();
+for (const r of SNAP.rows) SCALE.set(r[0], { yi: r[1] ?? null, date: SNAP.dates[r[2]] || '', buy: r[3] ?? null, buyOrig: r[4] ?? null });
 
 const TTL: Record<string, number> = {
   rank: 30 * 60e3,
@@ -430,8 +431,8 @@ function parseTxK(j: any, ksym: string) {
   }
   return bars.length ? bars : null;
 }
-async function getKline(ksym: string, fresh?: boolean): Promise<Kl> {
-  const c = readCache<Kl>('kl_' + ksym, TTL.kl, fresh);
+async function getKline(ksym: string, fresh?: boolean, ttl?: number): Promise<Kl> {
+  const c = readCache<Kl>('kl_' + ksym, ttl || TTL.kl, fresh);
   if (c) return c;
   return dedup('kl_' + ksym, async () => {
     let candidates = [ksym];
@@ -522,25 +523,85 @@ function monthDevOf(series: { d: string; ret: number | null; estRet: number | nu
   const offM = Math.round((off - 1) * 100000) / 1000, estM = Math.round((est - 1) * 100000) / 1000;
   return { devM: Math.round((offM - estM) * 1000) / 1000, offM, estM, nM: n, mStart, mEnd, reasonM: null };
 }
-async function yDevMany(codes: string[], fresh?: boolean) {
+/* ---------- 1日偏离：排序索引（模块级内存，实例存活期间复用） ---------- */
+type Dev1 = {
+  navDate: string; dev: number | null; estD: number | null; official: number | null;
+  covD?: number; reason: string | null; holdDate?: string; method?: string; retryAt?: number;
+};
+const DEV1 = new Map<string, Dev1>();
+const DEV1_FAIL_RETRY = 30 * 60e3;
+function dev1Valid(code: string, navDate: string): Dev1 | null {
+  const d = DEV1.get(code);
+  if (!d || d.navDate !== navDate) return null;
+  if (d.retryAt && Date.now() >= d.retryAt) return null;
+  return d;
+}
+function dev1Put(code: string, o: Dev1) { DEV1.set(code, o); }
+
+/* skipCached=true 时命中索引的基金不再请求接口（全市场扫描用） */
+async function dev1Core(codes: string[], fresh: boolean | undefined, klTtl: number, skipCached: boolean) {
   const u = await ensureUniverse(false);
-  const holds = await Promise.all(codes.map(async c => {
+  const out: Record<string, any> = {}, need: string[] = [];
+  for (const c of codes) {
+    const f = u.byCode.get(c);
+    if (!fresh && skipCached && f) {
+      const d = dev1Valid(c, f.navDate);
+      if (d) { out[c] = d; continue; }
+    }
+    need.push(c);
+  }
+  const holds = await Promise.all(need.map(async c => {
     try { return await getHoldings(c, fresh); } catch (e) { return { error: (e as Error).message } as Hold; }
   }));
   const ksyms = [...new Set(holds.flatMap(h => (h.stocks || []).map(s => s.ksym)))];
   const klMap: Record<string, Kl | null> = {};
   await Promise.all(ksyms.map(async k => {
-    try { klMap[k] = await getKline(k, fresh); } catch (_e) { klMap[k] = null; }
+    try { klMap[k] = await getKline(k, fresh, klTtl); } catch (_e) { klMap[k] = null; }
   }));
+  need.forEach((c, i) => {
+    const h = holds[i], f = u.byCode.get(c);
+    const D = f ? f.navDate : '';
+    let o: Dev1;
+    if (!h || h.error) o = { navDate: D, dev: null, estD: null, official: f ? f.chg : null, reason: (h && h.error) || '持仓获取失败', retryAt: Date.now() + DEV1_FAIL_RETRY };
+    else if (h.reason) o = { navDate: D, dev: null, estD: null, official: f ? f.chg : null, reason: h.reason, holdDate: h.date, method: h.method };
+    else if (!f || !f.navDate) o = { navDate: '', dev: null, estD: null, official: null, reason: '无最新净值数据' };
+    else {
+      let est = 0, cov = 0;
+      for (const s of h.stocks) {
+        const kl = klMap[s.ksym];
+        const r = kl && kl.rets[D];
+        if (r === undefined || r === null) continue;
+        est += s.w * r / 100; cov += s.w;
+      }
+      const base = { holdDate: h.date, method: h.method, navDate: D, official: f.chg };
+      if (cov <= 0) o = Object.assign(base, { dev: null, estD: null, covD: 0, reason: '净值日(' + D + ')持仓股无对应行情', retryAt: Date.now() + DEV1_FAIL_RETRY });
+      else {
+        const estD = Math.round(est * 1000) / 1000;
+        o = Object.assign(base, {
+          dev: f.chg !== null ? Math.round((f.chg - estD) * 1000) / 1000 : null,
+          estD, covD: Math.round(cov * 100) / 100,
+          reason: f.chg === null ? '官方涨幅缺失' : null
+        });
+      }
+    }
+    dev1Put(c, o);
+    out[c] = o;
+  });
+  return { out, holds, klMap, u, need };
+}
+async function dev1Many(codes: string[], fresh?: boolean, klTtl?: number) {
+  return (await dev1Core(codes, fresh, klTtl || TTL.kl, true)).out;
+}
+async function yDevMany(codes: string[], fresh?: boolean) {
+  const core = await dev1Core(codes, fresh, TTL.kl, false);
+  const { out, holds, klMap, u } = core;
   const pzs = await Promise.all(codes.map(async c => {
     try { return await getPz(c, fresh); } catch (_e) { return null; }
   }));
-  const out: Record<string, any> = {};
   codes.forEach((c, i) => {
     const h = holds[i], f = u.byCode.get(c);
-    if (!h || h.error) { out[c] = { dev: null, devM: null, reason: (h && h.error) || '持仓获取失败' }; return; }
-    if (h.reason) { out[c] = { dev: null, devM: null, reason: h.reason, holdDate: h.date }; return; }
-    if (!f || !f.navDate) { out[c] = { dev: null, devM: null, reason: '无最新净值数据' }; return; }
+    out[c].devM = null;
+    if (!h || h.error || h.reason || !f || !f.navDate) { out[c].reasonM = out[c].reason || '不可估算'; return; }
     const D = f.navDate;
     const estByDate = (d: string) => {
       let est = 0, cov = 0;
@@ -552,20 +613,8 @@ async function yDevMany(codes: string[], fresh?: boolean) {
       }
       return cov > 0 ? { est, cov } : null;
     };
-    const eD = estByDate(D);
-    const base = { holdDate: h.date, method: h.method, navDate: D };
-    if (!eD) {
-      out[c] = Object.assign(base, { dev: null, estD: null, official: f.chg, covD: 0, reason: '净值日(' + D + ')持仓股无对应行情' });
-    } else {
-      const estD = Math.round(eD.est * 1000) / 1000;
-      out[c] = Object.assign(base, {
-        dev: f.chg !== null ? Math.round((f.chg - estD) * 1000) / 1000 : null,
-        estD, official: f.chg, covD: Math.round(eD.cov * 100) / 100,
-        reason: f.chg === null ? '官方涨幅缺失' : null
-      });
-    }
     const pz = pzs[i];
-    if (!pz) { out[c].devM = null; out[c].reasonM = '净值历史获取失败'; return; }
+    if (!pz) { out[c].reasonM = '净值历史获取失败'; return; }
     const cut = monthCutoff(D);
     const series = pz.nav.filter(p => p.d > cut && p.d <= D).map(p => {
       const e = estByDate(p.d);
@@ -676,7 +725,7 @@ function scaleAgg(u: Univ, type: string | null, theme: string | null, q: string 
   let sumYi = 0, missing = 0, latestScaleDate = '';
   for (const f of list) {
     const s = SCALE.get(f.code);
-    if (s) { sumYi += s.yi; if (s.date > latestScaleDate) latestScaleDate = s.date; }
+    if (s && s.yi !== null) { sumYi += s.yi; if (s.date > latestScaleDate) latestScaleDate = s.date; }
     else missing++;
   }
   return {
@@ -686,6 +735,145 @@ function scaleAgg(u: Univ, type: string | null, theme: string | null, q: string 
     type: type || 'all', theme: theme || 'all', q: q || '', group: group || 'all',
     snapshotAt: SNAP.generatedAt.slice(0, 10), source: SNAP.source
   };
+}
+
+/* ---------- 排序索引：规模 / 费率（季报快照 + 实时缓存） ---------- */
+function baseOf(code: string) {
+  const b = readCache<Basic>('basic_' + code, TTL.basic, false);
+  const fe = readCache<Fee>('fee_' + code, TTL.fee, false);
+  const s = SCALE.get(code);
+  if (!b && !s) return null;
+  const scaleYi = b ? (b.endNav !== null && b.endNav > 0 ? b.endNav / 1e8 : null) : (s ? s.yi : null);
+  const scaleDate = b ? (b.scaleDate || '') : (s ? s.date : '');
+  const fallback = (buy: number | null, buyOrig: number | null): Fee | null =>
+    buy === null || buy === undefined ? null : { buy, buyOrig, buyTier: '', mgmt: null, custody: null, service: null };
+  const fee = fe || (b ? fallback(b.buy, b.buyOrig) : null) || (s ? fallback(s.buy, s.buyOrig) : null);
+  return { scaleYi, scaleDate, fee, has: true };
+}
+function sortValue(f: Fund, sort: string): number | null {
+  if (sort === 'dev1') {
+    const d = dev1Valid(f.code, f.navDate);
+    return d && d.dev !== null && d.dev !== undefined ? d.dev : null;
+  }
+  const b = baseOf(f.code);
+  if (!b) return null;
+  if (sort === 'scale') return b.scaleYi === undefined || b.scaleYi === null ? null : b.scaleYi;
+  if (sort === 'fee') return b.fee && b.fee.buy !== null && b.fee.buy !== undefined ? b.fee.buy : null;
+  return null;
+}
+function baseCoverage(list: Fund[], sort: string) {
+  let known = 0, undisclosed = 0, pending = 0;
+  for (const f of list) {
+    const b = baseOf(f.code);
+    if (!b) { pending++; continue; }
+    const v = sort === 'scale' ? b.scaleYi : (b.fee ? b.fee.buy : null);
+    if (v === null || v === undefined) undisclosed++; else known++;
+  }
+  return { known, undisclosed, pending };
+}
+
+/* ---------- 1日偏离全市场扫描：边缘按请求预算渐进推进，可暂停 ---------- */
+type DevJob = {
+  key: string; total: number; done: number; computed: number; na: number; failed: number; unknown: number;
+  running: boolean; cancel: boolean; paused: boolean; ticking: boolean; startedAt: number; finishedAt?: number;
+  navDate: string; type: string; theme: string; q: string; group: string;
+  cursor: number; codes: string[]; klTtl: number; error?: string;
+};
+const devJobs = new Map<string, DevJob>();
+let activeDev: DevJob | null = null;
+const DEV_SCAN_BUDGET = 15000; // 单次请求用于扫描的时间预算，其余时间留给交互请求
+function devKeyOf(type: string | null, theme: string | null, q: string | null, group: string | null, gcodes: unknown) {
+  return hash([type || 'all', theme || 'all', (q || '').trim().toLowerCase(), group || 'all',
+    Array.isArray(gcodes) ? gcodes.map(String).sort().join(',') : ''].join('|'));
+}
+function devCounters(list: Fund[]) {
+  let computed = 0, na = 0, failed = 0, unknown = 0;
+  for (const f of list) {
+    const d = dev1Valid(f.code, f.navDate);
+    if (!d) unknown++;
+    else if (d.dev !== null && d.dev !== undefined) computed++;
+    else if (d.retryAt) failed++;
+    else na++;
+  }
+  return { computed, na, failed, unknown };
+}
+function devStatus(job: DevJob | undefined, list: Fund[], u: Univ, type: string | null, theme: string | null, q: string | null, group: string | null, gcodes: unknown) {
+  const c = devCounters(list);
+  const base = {
+    key: devKeyOf(type, theme, q, group, gcodes), total: list.length, navDate: u.navDate,
+    type: type || 'all', theme: theme || 'all', q: q || '', group: group || 'all',
+    done: c.computed + c.na + c.failed, ...c
+  };
+  if (!job) return Object.assign(base, { running: false, idle: true, paused: false, cancel: false });
+  return Object.assign(base, {
+    running: job.running, paused: job.paused, cancel: job.cancel,
+    startedAt: job.startedAt, finishedAt: job.finishedAt, error: job.error, cursor: job.cursor
+  });
+}
+async function devScanTick(job: DevJob, budgetMs: number) {
+  if (job.ticking) return;
+  job.ticking = true;
+  const deadline = Date.now() + budgetMs;
+  try {
+    while (job.cursor < job.codes.length) {
+      if (job.cancel || job.paused) { job.running = false; return; }
+      if (Date.now() > deadline) return; // 预算用尽：保持 running，下一次轮询继续
+      const batch = job.codes.slice(job.cursor, job.cursor + 12);
+      job.cursor += batch.length;
+      try {
+        const r = await dev1Many(batch, false, job.klTtl);
+        for (const c of batch) {
+          const d = r[c];
+          if (d && d.dev !== null && d.dev !== undefined) job.computed++;
+          else if (d && d.retryAt) job.failed++;
+          else job.na++;
+        }
+      } catch (e) { job.failed += batch.length; log('dev scan batch fail:', (e as Error).message); }
+      job.done += batch.length;
+      job.unknown = Math.max(job.total - job.done, 0);
+    }
+    job.running = false; job.finishedAt = Date.now();
+    log('dev1 scan done', job.key, job.computed, '/', job.total);
+  } catch (e) {
+    job.running = false; job.error = (e as Error).message;
+  } finally { job.ticking = false; }
+}
+async function devScanCtl(action: string, type: string | null, theme: string | null, q: string | null, group: string | null, gcodes: unknown) {
+  const u = await ensureUniverse(false);
+  const gset = groupSetOf(group, gcodes);
+  const list = filterFunds(u, type, theme, q, gset);
+  const key = devKeyOf(type, theme, q, group, gcodes);
+  let job = devJobs.get(key);
+  if (action === 'stop') {
+    if (job) { job.paused = true; job.cancel = true; job.running = false; }
+    return devStatus(job, list, u, type, theme, q, group, gcodes);
+  }
+  if (action === 'status') {
+    if (job && job.running && !job.paused) await devScanTick(job, DEV_SCAN_BUDGET);
+    return devStatus(job, list, u, type, theme, q, group, gcodes);
+  }
+  // start / resume：重建当前筛选的代码表；已命中索引的基金会被跳过，不重复请求
+  const codes = list.map(f => f.code);
+  if (!job) {
+    if (devJobs.size > 4) for (const k of devJobs.keys()) { if (k !== key) devJobs.delete(k); }
+    job = {
+      key, total: codes.length, done: 0, computed: 0, na: 0, failed: 0, unknown: codes.length,
+      running: true, cancel: false, paused: false, ticking: false, startedAt: Date.now(), navDate: u.navDate,
+      type: type || 'all', theme: theme || 'all', q: q || '', group: group || 'all',
+      cursor: 0, codes,
+      klTtl: (u.navDate === bjDate(Date.now()) && tradingNow()) ? TTL.kl : 6 * 3600e3
+    };
+    devJobs.set(key, job);
+  } else {
+    job.codes = codes; job.total = codes.length; job.cursor = 0;
+    job.done = 0; job.computed = 0; job.na = 0; job.failed = 0; job.unknown = codes.length;
+    job.cancel = false; job.paused = false; job.running = codes.length > 0;
+    job.finishedAt = undefined; job.error = undefined;
+  }
+  if (activeDev && activeDev !== job && activeDev.running) { activeDev.cancel = true; activeDev.running = false; }
+  activeDev = job;
+  if (job.running) await devScanTick(job, DEV_SCAN_BUDGET);
+  return devStatus(job, list, u, type, theme, q, group, gcodes);
 }
 
 /* ---------- HTTP ---------- */
@@ -736,31 +924,48 @@ export async function handler(req: Request): Promise<Response> {
       let list = filterFunds(univ, get('type'), get('theme'), get('q'), groupSetOf(group, gcodes));
       const sort = get('sort') || 'chg', order = get('order') === 'asc' ? 1 : -1;
       const nv = (x: number | null) => x ?? -1e18;
-      const cmp: Record<string, (a: Fund, b: Fund) => number> = {
-        code: (a, b) => a.code.localeCompare(b.code),
-        name: (a, b) => a.name.localeCompare(b.name, 'zh'),
-        nav: (a, b) => nv(a.nav) - nv(b.nav),
-        chg: (a, b) => nv(a.chg) - nv(b.chg),
-        w1: (a, b) => nv(a.w1) - nv(b.w1),
-        m1: (a, b) => nv(a.m1) - nv(b.m1),
-        m3: (a, b) => nv(a.m3) - nv(b.m3),
-        m6: (a, b) => nv(a.m6) - nv(b.m6),
-        y1: (a, b) => nv(a.y1) - nv(b.y1),
-        ytd: (a, b) => nv(a.ytd) - nv(b.ytd)
-      };
-      const c = cmp[sort] || cmp.chg;
-      list = list.slice().sort((a, b) => order * c(a, b));
+      let sortInfo: Record<string, unknown> | null = null;
+      if (sort === 'scale' || sort === 'fee' || sort === 'dev1') {
+        // 全市场口径：无数据的基金统一排在末尾，同值按代码稳定排序
+        list = list.slice().sort((a, b) => {
+          const x = sortValue(a, sort), y = sortValue(b, sort);
+          if (x === null && y === null) return a.code < b.code ? -1 : 1;
+          if (x === null) return 1;
+          if (y === null) return -1;
+          return x === y ? (a.code < b.code ? -1 : 1) : order * (x - y);
+        });
+        if (sort === 'dev1') {
+          const job = devJobs.get(devKeyOf(get('type'), get('theme'), get('q'), group, gcodes));
+          sortInfo = Object.assign({ key: 'dev1', total: list.length, running: !!(job && job.running), navDate: univ.navDate }, devCounters(list));
+        } else {
+          sortInfo = Object.assign({ key: sort, total: list.length, running: false, snapshotAt: SNAP.generatedAt.slice(0, 10) }, baseCoverage(list, sort));
+        }
+      } else {
+        const cmp: Record<string, (a: Fund, b: Fund) => number> = {
+          code: (a, b) => a.code.localeCompare(b.code),
+          name: (a, b) => a.name.localeCompare(b.name, 'zh'),
+          nav: (a, b) => nv(a.nav) - nv(b.nav),
+          chg: (a, b) => nv(a.chg) - nv(b.chg),
+          w1: (a, b) => nv(a.w1) - nv(b.w1),
+          m1: (a, b) => nv(a.m1) - nv(b.m1),
+          m3: (a, b) => nv(a.m3) - nv(b.m3),
+          m6: (a, b) => nv(a.m6) - nv(b.m6),
+          y1: (a, b) => nv(a.y1) - nv(b.y1),
+          ytd: (a, b) => nv(a.ytd) - nv(b.ytd)
+        };
+        const c = cmp[sort] || cmp.chg;
+        list = list.slice().sort((a, b) => order * c(a, b));
+      }
       const page = Math.max(parseInt(String(get('page'))) || 1, 1);
       const size = Math.min(Math.max(parseInt(String(get('size'))) || 50, 10), 120);
       const rows = list.slice((page - 1) * size, page * size).map(f => {
         const o = Object.assign({}, f) as Fund & { scaleYi?: number; scaleDate?: string; fee?: Fee };
-        const s = SCALE.get(f.code);
-        if (s) { o.scaleYi = Math.round(s.yi * 1e4) / 1e4; o.scaleDate = s.date; }
-        const fe = readCache<Fee>('fee_' + f.code, TTL.fee, false);
-        if (fe) o.fee = fe;
+        const b = baseOf(f.code);
+        if (b && b.scaleYi !== null && b.scaleYi !== undefined) { o.scaleYi = Math.round(b.scaleYi * 1e4) / 1e4; o.scaleDate = b.scaleDate; }
+        if (b && b.fee) o.fee = b.fee;
         return o;
       });
-      return sendJson({ total: list.length, page, size, navDate: univ.navDate, rows });
+      return sendJson({ total: list.length, page, size, navDate: univ.navDate, rows, sortInfo });
     }
     if (p === '/extras') {
       const codes = codesOf(get('codes'), 12);
@@ -772,11 +977,14 @@ export async function handler(req: Request): Promise<Response> {
           snap ? Promise.resolve(null) : getBasic(c, fresh).catch(() => null),
           getFee(c, fresh).catch(() => null)
         ]);
-        const scaleYi = snap ? Math.round(snap.yi * 1e4) / 1e4 : (b && b.endNav !== null && b.endNav > 0 ? Math.round(b.endNav / 1e4) / 1e4 : null);
+        const yi = snap ? snap.yi : (b && b.endNav !== null && b.endNav > 0 ? b.endNav / 1e8 : null);
+        const scaleYi = yi === null || yi === undefined ? null : Math.round(yi * 1e4) / 1e4;
         const scaleDate = snap ? snap.date : (b ? b.scaleDate : '');
+        const buy = b ? b.buy : (snap ? snap.buy : null);
+        const buyOrig = b ? b.buyOrig : (snap ? snap.buyOrig : null);
         out[c] = {
           scaleYi, scaleDate,
-          fee: fe || (b && b.buy !== null && b.buy !== undefined ? { buy: b.buy, buyOrig: b.buyOrig, buyTier: '', mgmt: null, custody: null, service: null } : null),
+          fee: fe || (buy !== null && buy !== undefined ? { buy, buyOrig, buyTier: '', mgmt: null, custody: null, service: null } : null),
           reason: scaleYi === null && !fe ? '规模未披露/费率获取失败' : null
         };
       }));
@@ -800,6 +1008,13 @@ export async function handler(req: Request): Promise<Response> {
       const job = scaleAgg(univ, get('type'), get('theme'), get('q'), group, gcodes);
       writeCache('agg_' + key, job);
       return sendJson(job);
+    }
+    if (p === '/dev1-scan') {
+      const group = get('group') || 'all';
+      const gcodes = Array.isArray(body.gcodes) ? body.gcodes : (sp.get('gcodes') ? sp.get('gcodes')!.split(',') : null);
+      const action = get('action') || 'status';
+      if (!['start', 'stop', 'status'].includes(action)) return sendJson({ error: '未知扫描动作 ' + action }, 400);
+      return sendJson(await devScanCtl(action, get('type'), get('theme'), get('q'), group, gcodes));
     }
     return sendJson({ error: '未知接口 ' + p }, 404);
   } catch (e) {

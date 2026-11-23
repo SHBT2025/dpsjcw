@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>盯盘神经（场外基金）· 持仓法净值估算终端</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Ccircle cx='20' cy='20' r='17.5' fill='%230a0f1c' stroke='%232e4066' stroke-width='2'/%3E%3Cpath d='M20 4.5 L23.2 17.8 L20 20 L16.8 17.8 Z' fill='%23fbbf24'/%3E%3Cpath d='M20 35.5 L16.8 22.2 L20 20 L23.2 22.2 Z' fill='%2338bdf8'/%3E%3Cpath d='M4.5 20 L17.8 16.8 L20 20 L17.8 23.2 Z' fill='%23ff5b5b'/%3E%3Cpath d='M35.5 20 L22.2 23.2 L20 20 L22.2 16.8 Z' fill='%23a78bfa'/%3E%3Ccircle cx='20' cy='20' r='2.4' fill='%23e8eaf2'/%3E%3C/svg%3E">
 <style>
 :root{
   /* 设计变量（默认值 = 原深色终端配色） */
@@ -176,6 +177,16 @@ tbody tr:last-child td{border-bottom:none}
 .aggprog{flex:1;min-width:140px;max-width:340px;height:6px;border-radius:4px;background:var(--line);overflow:hidden;position:relative}
 .aggprog i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,#d97706,#fbbf24);transition:width .4s}
 .aggprog.run::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);animation:shim 1.4s infinite linear;background-size:200% 100%}
+/* ===== 排序状态条：规模 / 费率 / 1日偏离 ===== */
+.sortbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 10px;padding:8px 12px;background:linear-gradient(90deg,rgba(251,191,36,.07),rgba(22,33,58,.6) 42%);border:1px solid var(--line2);border-left:3px solid var(--est2);border-radius:10px}
+.sortbar .slab{font-size:12px;font-weight:700;color:var(--est);letter-spacing:.4px;flex-shrink:0}
+.sortbar .slab small{font-weight:400;color:var(--muted);margin-left:5px}
+.sortbar .sprog{flex:1;min-width:110px;max-width:280px;height:5px;border-radius:3px;background:var(--line);overflow:hidden;position:relative}
+.sortbar .sprog i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,#0284c7,#22d3ee);transition:width .4s}
+.sortbar.run .sprog i{background:linear-gradient(90deg,#d97706,#fbbf24)}
+.sortbar.run .sprog::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent);animation:shim 1.4s infinite linear;background-size:200% 100%}
+.sortbar .smeta{font-size:11.5px;color:var(--muted);flex:1;min-width:190px;line-height:1.5}
+.sortbar .btn{padding:4px 11px;font-size:11.5px;flex-shrink:0}
 /* ===== 弹窗 ===== */
 .scrim{position:fixed;inset:0;z-index:80;background:rgba(4,8,16,.72);backdrop-filter:blur(3px);display:none;align-items:flex-start;justify-content:center;padding:3vh 14px;overflow-y:auto}
 .scrim.open{display:flex}
@@ -274,7 +285,7 @@ main{padding-left:calc(16px * var(--site-space,1));padding-right:calc(16px * var
 .toast{animation-duration:calc(.2s * var(--site-motion,1))}
 @media (prefers-reduced-motion:reduce){
   .btn,.tab,.chip,.actbtn,.mclose,.cp-item,.search,tbody tr{transition-duration:.01ms}
-  .rowin,.modal,.toast,.pending,.spin,.aggprog.run::after{animation-duration:.01ms;animation-iteration-count:1}
+  .rowin,.modal,.toast,.pending,.spin,.aggprog.run::after,.sortbar.run .sprog::after{animation-duration:.01ms;animation-iteration-count:1}
 }
 /* ===== 移动端 ===== */
 .cards-m{display:none}
@@ -308,6 +319,9 @@ main{padding-left:calc(16px * var(--site-space,1));padding-right:calc(16px * var
   .aggbar{gap:8px;padding:8px 12px}
   .aggbar .sum{font-size:16px}
   .aggprog{max-width:none;order:9;flex-basis:100%}
+  .sortbar{gap:8px;padding:7px 10px;margin-bottom:8px}
+  .sortbar .sprog{max-width:none;order:9;flex-basis:100%}
+  .sortbar .smeta{min-width:0;flex-basis:100%;order:8}
   .infoline{gap:8px}
   #catPop{left:0!important;right:0!important;bottom:0!important;top:auto!important;width:auto;max-height:62vh;border-radius:14px 14px 0 0}
   #catScrim{padding:0;align-items:flex-end}
@@ -372,6 +386,9 @@ main{padding-left:calc(16px * var(--site-space,1));padding-right:calc(16px * var
       <option value="m6">近6月</option>
       <option value="y1">近1年</option>
       <option value="ytd">今年来</option>
+      <option value="scale">规模(亿)</option>
+      <option value="fee">费率</option>
+      <option value="dev1">1日偏离</option>
       <option value="code">代码</option>
       <option value="name">名称</option>
     </select>
@@ -390,6 +407,7 @@ main{padding-left:calc(16px * var(--site-space,1));padding-right:calc(16px * var
 
 <main>
   <div id="errSlot"></div>
+  <div class="sortbar" id="sortBar" style="display:none"></div>
   <div class="tablewrap">
     <table>
       <thead><tr>
@@ -397,10 +415,10 @@ main{padding-left:calc(16px * var(--site-space,1));padding-right:calc(16px * var
         <th class="sortable" data-sort="nav">单位净值<span class="arr"></span></th>
         <th class="sortable" data-sort="chg">官方涨幅<span class="arr"></span></th>
         <th title="按最新季报前十大重仓股 × 实时行情估算">今日估算<span class="arr"></span></th>
-        <th title="最新净值日：官方公布涨幅 − 估算涨幅（百分点）。正=官方高于估算，负=估算偏高">1日偏离<span class="arr"></span></th>
+        <th class="sortable" data-sort="dev1" title="最新净值日：官方公布涨幅 − 估算涨幅（百分点）。正=官方高于估算，负=估算偏高。点击排序（全市场扫描计算）">1日偏离<span class="arr"></span></th>
         <th title="近1月：官方累计涨幅 − 估算累计涨幅（百分点，同一批可估算交易日复利）">1月偏离<span class="arr"></span></th>
-        <th title="最新季报披露规模（亿元），约3个月更新一次">规模(亿)<span class="arr"></span></th>
-        <th title="申购费率（天天基金优惠，最低档）；悬停查看原价/管理/托管/销售服务费">费率<span class="arr"></span></th>
+        <th class="sortable" data-sort="scale" title="最新季报披露规模（亿元），约3个月更新一次。点击排序">规模(亿)<span class="arr"></span></th>
+        <th class="sortable" data-sort="fee" title="申购费率（天天基金优惠，最低档）；悬停查看原价/管理/托管/销售服务费。点击排序">费率<span class="arr"></span></th>
         <th class="sortable" data-sort="m1">近1月<span class="arr"></span></th>
         <th class="sortable" data-sort="m3">近3月<span class="arr"></span></th>
         <th class="sortable" data-sort="y1">近1年<span class="arr"></span></th>
@@ -873,7 +891,9 @@ function renderRows(){
   }
   renderPager();
   document.querySelectorAll('thead th.sortable').forEach(th=>{
-    th.querySelector('.arr').textContent = th.dataset.sort===state.sort ? (state.order==='desc'?'▼':'▲') : '';
+    const on = th.dataset.sort===state.sort;
+    th.querySelector('.arr').textContent = on ? (state.order==='desc'?'▼':'▲') : '';
+    th.setAttribute('aria-sort', on ? (state.order==='desc'?'descending':'ascending') : 'none');
   });
 }
 function updateEnrichCells(){
@@ -941,6 +961,9 @@ async function loadFunds(fresh){
       renderRows();
       enrichToday(false); enrichDev(false); enrichExtras(false);
       startAgg();
+      sortInfoCur = j.sortInfo || null;
+      renderSortBar(sortInfoCur);
+      syncSortWatch();
     }while(fundsQueued);
   }catch(e){
     netErr(e);
@@ -1078,6 +1101,103 @@ function startAgg(){
   if(aggTimer){ clearTimeout(aggTimer); aggTimer=null; }
   renderAgg(null);
   pollAgg();
+}
+
+/* ================= 排序：规模 / 费率 / 1日偏离（全市场口径，无数据排末尾） ================= */
+const SORT_KEYS = ['scale','fee','dev1'];
+const SORT_LABEL = {scale:'规模(亿)', fee:'费率', dev1:'1日偏离'};
+let sortTimer=null, sortTicking=false, sortInfoCur=null, lastSortRefresh=0, devScanPaused=false, devAutoKey='';
+function sortActive(){ return SORT_KEYS.includes(state.sort); }
+function stopSortWatch(){ if(sortTimer){ clearTimeout(sortTimer); sortTimer=null; } }
+function scanToSortInfo(j){
+  return {key:'dev1', total:j.total||0, computed:j.computed||0, na:j.na||0, failed:j.failed||0, unknown:j.unknown||0, running:!!j.running, navDate:j.navDate||''};
+}
+function scanApi(action, timeout){
+  const p = Object.assign(Object.fromEntries(aggParams()), {action});
+  return HOSTED && state.group!=='all'
+    ? api('/api/dev1-scan', timeout||45000, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.assign(p,{gcodes:groupCodes()}))})
+    : api('/api/dev1-scan?'+new URLSearchParams(p), timeout||45000);
+}
+async function devScanCtl(action){
+  try{
+    const j = await scanApi(action, 45000);
+    if(state.sort==='dev1'){ sortInfoCur = scanToSortInfo(j); renderSortBar(sortInfoCur); }
+    return j;
+  }catch(e){ toast('偏离扫描'+(action==='start'?'启动':'停止')+'失败：'+e.message, 'err'); return null; }
+}
+function renderSortBar(si){
+  const bar = $('#sortBar');
+  if(!si || !sortActive()){ bar.style.display='none'; bar.innerHTML=''; bar.classList.remove('run'); return; }
+  bar.style.display='';
+  const isDev = si.key==='dev1';
+  const known = isDev ? (si.computed+si.na+si.failed) : (si.known+si.undisclosed);
+  const pct = si.total ? Math.min(known/si.total*100,100) : 0;
+  const running = !!si.running;
+  bar.classList.toggle('run', running);
+  let meta;
+  if(isDev){
+    meta = `已计算 ${si.computed.toLocaleString()} · 不适用/无行情 ${(si.na+si.failed).toLocaleString()} · 待扫描 ${si.unknown.toLocaleString()} / 共 ${si.total.toLocaleString()} 只`;
+    if(running) meta = `扫描中 ${known.toLocaleString()}/${si.total.toLocaleString()} · ` + meta;
+    if(HOSTED) meta += ' · 网页版进度存于云端实例内存，实例回收后需继续扫描';
+  }else{
+    meta = `已有数据 ${si.known.toLocaleString()} · 未披露 ${si.undisclosed.toLocaleString()} · 待补齐 ${si.pending.toLocaleString()} / 共 ${si.total.toLocaleString()} 只`;
+    if(running) meta = `补齐中 ${(si.sweepDone||0).toLocaleString()}/${(si.sweepTotal||si.total).toLocaleString()} · ` + meta;
+    if(HOSTED) meta += ` · 网页版取自季报快照${si.snapshotAt?'（'+si.snapshotAt+'）':''}`;
+  }
+  meta += HOSTED ? ' · 无数据排在末尾' : '（无数据排在末尾）';
+  let ctl = '';
+  if(isDev){
+    ctl = running ? '<button class="btn" id="sortPauseBtn">暂停扫描</button>'
+      : ((si.unknown+si.failed)>0 ? '<button class="btn" id="sortResumeBtn">继续扫描</button>' : '');
+  }else if(!running && si.pending>0 && !HOSTED){
+    ctl = '<button class="btn" id="sortSweepBtn">重新补齐</button>';
+  }
+  bar.innerHTML = `<span class="slab">排序 · ${SORT_LABEL[state.sort]}<small>${state.order==='desc'?'降序':'升序'}</small></span>`
+    + `<div class="sprog"><i style="width:${pct.toFixed(1)}%"></i></div>`
+    + `<span class="smeta num">${meta}</span>` + ctl;
+  const pb=$('#sortPauseBtn'); if(pb) pb.onclick=async()=>{ devScanPaused=true; await devScanCtl('stop'); };
+  const rb=$('#sortResumeBtn'); if(rb) rb.onclick=async()=>{ devScanPaused=false; await devScanCtl('start'); lastSortRefresh=0; syncSortWatch(); };
+  const sb=$('#sortSweepBtn'); if(sb) sb.onclick=async()=>{
+    sb.disabled=true; sb.textContent='补齐中…';
+    try{ await api('/api/scale-agg?'+aggParams()+'&fresh=1', 40000); }catch(e){}
+    lastSortRefresh=0; await loadFunds(false); syncSortWatch();
+  };
+}
+function syncSortWatch(){
+  if(!sortActive()){ stopSortWatch(); sortInfoCur=null; renderSortBar(null); return; }
+  const sig = state.sort+'|'+aggSig();
+  if(state.sort==='dev1' && !devScanPaused && devAutoKey!==sig){ devAutoKey=sig; devScanCtl('start'); }
+  if(!sortTimer && !sortTicking) sortTimer=setTimeout(sortTick, 900);
+}
+/* 离开偏离排序时暂停扫描（回到该排序会自动继续），避免后台无谓占用带宽 */
+function afterSortChange(prev){
+  if(prev==='dev1' && state.sort!=='dev1'){ devAutoKey=''; devScanCtl('stop'); }
+  lastSortRefresh=0;
+}
+async function sortTick(){
+  sortTimer=null;
+  if(!sortActive() || sortTicking) return;
+  sortTicking=true;
+  try{
+    if(state.sort==='dev1'){
+      const j = await scanApi('status', 45000);
+      if(state.sort!=='dev1') return;
+      sortInfoCur = scanToSortInfo(j); renderSortBar(sortInfoCur);
+      if(j.running){
+        // 扫描期间节流重排，避免行频繁跳动；扫描结束立即按完整结果重排
+        if(Date.now()-lastSortRefresh>10000){ lastSortRefresh=Date.now(); await loadFunds(false); }
+        sortTimer=setTimeout(sortTick, HOSTED?500:2500);
+      }else{
+        await loadFunds(false);
+      }
+    }else{
+      if(Date.now()-lastSortRefresh>8000){ lastSortRefresh=Date.now(); await loadFunds(false); }
+      const si=sortInfoCur;
+      if(si && si.running) sortTimer=setTimeout(sortTick, 5000);
+    }
+  }catch(e){
+    if(sortActive()) sortTimer=setTimeout(sortTick, 9000);
+  } finally { sortTicking=false; }
 }
 
 /* ================= 详情弹窗 ================= */
@@ -1429,7 +1549,7 @@ $('#searchInput').addEventListener('input',ev=>{
   clearTimeout(searchTimer);
   searchTimer=setTimeout(()=>{ state.q=ev.target.value.trim(); state.page=1; saveState(); loadFunds(false); },350);
 });
-$('#sortSel').addEventListener('change',ev=>{ state.sort=ev.target.value; state.page=1; saveState(); loadFunds(false); });
+$('#sortSel').addEventListener('change',ev=>{ const prev=state.sort; state.sort=ev.target.value; state.page=1; saveState(); afterSortChange(prev); loadFunds(false); });
 $('#orderBtn').addEventListener('click',()=>{
   state.order=state.order==='desc'?'asc':'desc';
   $('#orderBtn').textContent=state.order==='desc'?'↓ 降序':'↑ 升序';
@@ -1443,11 +1563,11 @@ $('#pager').addEventListener('click',ev=>{
 });
 document.querySelector('thead').addEventListener('click',ev=>{
   const th=ev.target.closest('th.sortable'); if(!th) return;
-  const k=th.dataset.sort;
+  const k=th.dataset.sort, prev=state.sort;
   if(state.sort===k) state.order=state.order==='desc'?'asc':'desc';
   else { state.sort=k; state.order='desc'; }
   $('#sortSel').value=k; $('#orderBtn').textContent=state.order==='desc'?'↓ 降序':'↑ 升序';
-  state.page=1; saveState(); loadFunds(false);
+  state.page=1; saveState(); afterSortChange(prev); loadFunds(false);
 });
 function onActClick(ev){
   const b = ev.target.closest('[data-act]');
