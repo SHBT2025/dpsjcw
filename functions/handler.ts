@@ -696,14 +696,11 @@ function sendJson(obj: unknown, status = 200) {
   });
 }
 function routePath(p: string) {
+  // 网关可能以 /functions/v1/app/<接口> 或 /app/<接口> 挂载；本地预览也可能带 /api 前缀
   let s = p;
-  const i = s.indexOf('/functions/v1/');
-  if (i >= 0) {
-    s = s.slice(i + '/functions/v1/'.length);
-    const j = s.indexOf('/');
-    s = j >= 0 ? s.slice(j) : '/';
-  }
-  if (s.startsWith('/api/')) s = s.slice(4);
+  s = s.replace(/^\/functions\/v1\/[^/]+(?=\/|$)/, '');
+  s = s.replace(/^\/app(?=\/|$)/, '');
+  s = s.replace(/^\/api(?=\/|$)/, '');
   if (!s.startsWith('/')) s = '/' + s;
   return s.replace(/\/+$/, '') || '/';
 }
