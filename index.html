@@ -6,16 +6,21 @@
 <title>盯盘神经（场外基金）· 持仓法净值估算终端</title>
 <style>
 :root{
-  --bg:#0a0f1c; --bg2:#0d1526; --surface:#111a2e; --surface2:#16213a; --overlay:#1b2947;
-  --line:#233150; --line2:#2e4066;
-  --txt:#e8eaf2; --muted:#8b96b3; --dim:#5d6a8a;
+  /* 设计变量（默认值 = 原深色终端配色） */
+  --site-bg:#0a0f1c; --site-fg:#e8eaf2; --site-accent:#38bdf8; --site-on-accent:#fff;
+  --site-surface:#111a2e; --site-muted:#8b96b3; --site-border:#233150;
+  --site-font:"PingFang SC","Microsoft YaHei","Noto Sans SC",system-ui,sans-serif;
+  --site-radius:10px; --site-space:1; --site-type:1; --site-motion:1;
+  --bg:var(--site-bg); --bg2:#0d1526; --surface:var(--site-surface); --surface2:#16213a; --overlay:#1b2947;
+  --line:var(--site-border); --line2:#2e4066;
+  --txt:var(--site-fg); --muted:var(--site-muted); --dim:#5d6a8a;
   --up:#ff5b5b; --up-bg:rgba(255,91,91,.12);
   --down:#22c55e; --down-bg:rgba(34,197,94,.12);
   --est:#fbbf24; --est2:#f59e0b; --est-bg:rgba(251,191,36,.1);
-  --off:#38bdf8; --off2:#22d3ee; --off-bg:rgba(56,189,248,.1);
+  --off:var(--site-accent); --off2:#22d3ee; --off-bg:rgba(56,189,248,.1);
   --vio:#a78bfa; --vio-bg:rgba(167,139,250,.12);
   --warn:#fb923c; --danger:#f43f5e; --ok:#34d399;
-  --r:10px; --hh:56px;
+  --r:var(--site-radius); --hh:56px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scrollbar-color:#2a3b5f #0d1526}
@@ -252,6 +257,25 @@ tbody tr:last-child td{border-bottom:none}
 .down h2{font-size:17px;margin-bottom:12px;color:var(--warn)}
 .down p{font-size:13px;color:var(--muted);line-height:1.9;margin-bottom:8px}
 .down code{background:var(--bg);border:1px solid var(--line2);border-radius:6px;padding:2px 8px;color:var(--est);font-size:12.5px}
+/* ===== 设计变量消费 ===== */
+body{font-family:var(--site-font);font-size:calc(14px * var(--site-type,1))}
+.brand h1{font-size:calc(17px * var(--site-type,1))}
+.brand small{font-size:calc(10.5px * var(--site-type,1))}
+header{padding:0 calc(16px * var(--site-space,1))}
+.filters{padding-left:calc(16px * var(--site-space,1));padding-right:calc(16px * var(--site-space,1))}
+main{padding-left:calc(16px * var(--site-space,1));padding-right:calc(16px * var(--site-space,1))}
+.btn,.mclose,.actbtn,.search{border-radius:calc(var(--site-radius) * .8)}
+.modal{border-radius:calc(var(--site-radius) + 4px)}
+.down .box{border-radius:calc(var(--site-radius) + 4px)}
+.btn.primary{color:var(--site-on-accent)}
+.btn,.tab,.chip,.actbtn,.mclose,.cp-item,.search,tbody tr{transition-duration:calc(.15s * var(--site-motion,1))}
+.rowin{animation-duration:calc(.22s * var(--site-motion,1))}
+.modal{animation-duration:calc(.18s * var(--site-motion,1))}
+.toast{animation-duration:calc(.2s * var(--site-motion,1))}
+@media (prefers-reduced-motion:reduce){
+  .btn,.tab,.chip,.actbtn,.mclose,.cp-item,.search,tbody tr{transition-duration:.01ms}
+  .rowin,.modal,.toast,.pending,.spin,.aggprog.run::after{animation-duration:.01ms;animation-iteration-count:1}
+}
 /* ===== 移动端 ===== */
 .cards-m{display:none}
 @media (max-width:920px){
@@ -443,12 +467,12 @@ tbody tr:last-child td{border-bottom:none}
       <h4>自选与自定义分类</h4>
       <ul>
         <li>点击行尾 ☆ 加自选；点击 ＋ 可把基金加入任意自定义分类（可现场新建）。分组行可筛选、重命名、删除分类（删除可撤销）。</li>
-        <li>自选与分类保存在本机服务的 userdata.json 中，<b>不上传任何服务器</b>；换浏览器打开仍在。</li>
+        <li id="docStore">自选与分类保存在本机服务的 userdata.json 中，<b>不上传任何服务器</b>；换浏览器打开仍在。</li>
       </ul>
       <h4>时效与免责</h4>
       <ul>
         <li>官方净值为盘后披露（QDII 通常再滞后1~2天），免费源不存在盘中"真实净值"。</li>
-        <li>规模数据为季报披露（约3个月一次），底部类目合计随统计进度渐进展示，结果本地缓存。</li>
+        <li id="docAgg">规模数据为季报披露（约3个月一次），底部类目合计随统计进度渐进展示，结果本地缓存。</li>
         <li class="warn">本工具仅供个人研究学习，不构成任何投资建议。估算存在系统性局限，请以基金公司官方披露为准。</li>
       </ul>
     </div>
@@ -486,7 +510,9 @@ tbody tr:last-child td{border-bottom:none}
 <script>
 'use strict';
 /* ================= 基础 ================= */
-const API = location.protocol === 'file:' ? 'http://127.0.0.1:8788' : '';
+/* 本机数据桥固定 serving 于 8788；其余 http(s) 源视为网页版（同源云函数） */
+const HOSTED = /^https?:$/.test(location.protocol) && location.port !== '8788';
+const API = HOSTED ? '/functions/v1/app' : (location.protocol === 'file:' ? 'http://127.0.0.1:8788' : '');
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const LS_KEY = 'jjlp_state_v1';
@@ -516,15 +542,20 @@ function toast(msg, kind, action){ const t=document.createElement('div'); t.clas
 async function api(path, timeoutMs, opts){
   const ctl = new AbortController(); const timer = setTimeout(()=>ctl.abort(), timeoutMs||30000);
   try{
-    const r = await fetch(API+path, Object.assign({signal:ctl.signal}, opts||{}));
+    const r = await fetch(API + (HOSTED ? path.replace(/^\/api/, '') : path), Object.assign({signal:ctl.signal}, opts||{}));
     const j = await r.json();
     if(j && j.error) throw new Error(j.error);
     return j;
   } finally { clearTimeout(timer); }
 }
-/* 自选/分类：本机服务端持久化，乐观更新 + 失败重试 */
+/* 自选/分类：本机版存服务端 userdata.json；网页版存本浏览器 localStorage */
+const UKEY = 'dpsj_user_v1';
 async function loadUser(){
-  try{ USER = await api('/api/userdata', 10000); }catch(e){ USER = {watch:[],cats:[]}; }
+  if(HOSTED){
+    try{ USER = JSON.parse(localStorage.getItem(UKEY)) || {watch:[],cats:[]}; }catch(e){ USER = {watch:[],cats:[]}; }
+  }else{
+    try{ USER = await api('/api/userdata', 10000); }catch(e){ USER = {watch:[],cats:[]}; }
+  }
   if(!Array.isArray(USER.watch)) USER.watch=[];
   if(!Array.isArray(USER.cats)) USER.cats=[];
 }
@@ -536,6 +567,11 @@ function saveUser(){
 async function flushUser(){
   if(!userDirty) return;
   userDirty = false;
+  if(HOSTED){
+    try{ localStorage.setItem(UKEY, JSON.stringify(USER)); }
+    catch(e){ toast('自选/分类保存失败（浏览器存储不可用）：'+e.message, 'err'); }
+    return;
+  }
   try{
     await api('/api/userdata', 10000, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(USER)});
   }catch(e){
@@ -545,6 +581,18 @@ async function flushUser(){
   }
 }
 function showDown(on){ $('#downBox').classList.toggle('open', on); }
+function applyHostedUI(){
+  const d = $('#downBox');
+  d.querySelector('h2').textContent = '⚠ 数据服务连接失败';
+  const ps = d.querySelectorAll('p');
+  ps[0].textContent = '网页版通过同源云函数代为请求公开数据（东方财富 / 腾讯行情）。';
+  ps[1].textContent = '可能是上游限流或网络波动，请稍后点击重试。';
+  ps[2].textContent = '首次加载需拉取全市场基金列表（约2.5万只），可能需要十几秒。';
+  const sm = document.querySelector('.brand small');
+  if(sm) sm.textContent = '场外基金 · 持仓法净值估算 · 网页版';
+  $('#docStore').innerHTML = '网页版的自选与分类保存在<b>本浏览器 localStorage</b> 中，不上传服务器；清除浏览器数据或换设备会丢失。';
+  $('#docAgg').innerHTML = '规模数据为季报披露（约3个月一次）。网页版底部类目合计按<b>季报快照</b>即时汇总（快照汇总日期见底部标注），单只基金的规模/净值/行情仍为真实请求。';
+}
 function netErr(e){
   if(e instanceof TypeError || (e.name==='AbortError')) { showDown(true); }
   else toast('请求失败：'+e.message, 'err');
@@ -878,7 +926,9 @@ async function loadFunds(fresh){
       fundsQueued = false;
       const params = new URLSearchParams({type:state.type,theme:state.theme,group:state.group,q:state.q,sort:state.sort,order:state.order,page:state.page,size:state.size});
       if(fresh) params.set('fresh','1');
-      const j = await api('/api/funds?'+params, 60000);
+      const j = HOSTED && state.group!=='all'
+        ? await api('/api/funds', 60000, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.assign(Object.fromEntries(params), {gcodes:groupCodes()}))})
+        : await api('/api/funds?'+params, 60000);
       ROWS = j.rows; TOTAL = j.total;
       for(const r of ROWS){
         if(r.scaleYi!==undefined || r.fee!==undefined){
@@ -903,9 +953,20 @@ async function enrichToday(fresh){
   pendingEst = true;
   const codes = ROWS.map(r=>r.code).join(',');
   try{
-    const j = await api('/api/est-today?codes='+codes+(fresh?'&fresh=1':''), 60000);
-    Object.assign(estMap, j);
-    updateEnrichCells();
+    if(HOSTED){
+      const arr = ROWS.map(r=>r.code);
+      for(let i=0;i<arr.length;i+=12){
+        const part = arr.slice(i,i+12);
+        try{
+          Object.assign(estMap, await api('/api/est-today?codes='+part.join(',')+(fresh?'&fresh=1':''), 45000));
+          updateEnrichCells();
+        }catch(e){ if(i===0 && !estRetry){ estRetry=true; setTimeout(()=>{ estRetry=false; enrichToday(false); }, 20000); } }
+      }
+    }else{
+      const j = await api('/api/est-today?codes='+codes+(fresh?'&fresh=1':''), 60000);
+      Object.assign(estMap, j);
+      updateEnrichCells();
+    }
   }catch(e){ if(!estRetry){ estRetry=true; setTimeout(()=>{ estRetry=false; enrichToday(false); }, 20000); } }
   finally{
     pendingEst = false;
@@ -917,9 +978,20 @@ async function enrichDev(fresh){
   pendingDev = true;
   const codes = ROWS.map(r=>r.code).join(',');
   try{
-    const j = await api('/api/ydev?codes='+codes+(fresh?'&fresh=1':''), 150000);
-    Object.assign(devMap, j);
-    updateEnrichCells();
+    if(HOSTED){
+      const arr = ROWS.map(r=>r.code);
+      for(let i=0;i<arr.length;i+=6){
+        const part = arr.slice(i,i+6);
+        try{
+          Object.assign(devMap, await api('/api/ydev?codes='+part.join(',')+(fresh?'&fresh=1':''), 60000));
+          updateEnrichCells();
+        }catch(e){ if(i===0 && !devRetry){ devRetry=true; setTimeout(()=>{ devRetry=false; enrichDev(false); }, 25000); } }
+      }
+    }else{
+      const j = await api('/api/ydev?codes='+codes+(fresh?'&fresh=1':''), 150000);
+      Object.assign(devMap, j);
+      updateEnrichCells();
+    }
   }catch(e){ if(!devRetry){ devRetry=true; setTimeout(()=>{ devRetry=false; enrichDev(false); }, 25000); } }
   finally{
     pendingDev = false;
@@ -963,6 +1035,11 @@ setInterval(()=>{
 
 /* ================= 类目规模聚合 ================= */
 function aggParams(){ return new URLSearchParams({type:state.type,theme:state.theme,group:state.group,q:state.q}); }
+function groupCodes(){
+  if(state.group==='watch') return USER.watch.slice();
+  const c = catById(state.group);
+  return c ? c.codes.slice() : [];
+}
 function aggSig(){
   let g = state.group;
   if(g==='watch') g += ':' + USER.watch.slice().sort().join(',');
@@ -980,14 +1057,16 @@ function renderAgg(j){
   } else {
     prog.classList.remove('run');
     prog.style.display=''; prog.firstElementChild.style.width='100%';
-    meta.textContent = `${j.total.toLocaleString()} 只` + (j.missing?` · ${j.missing} 只未披露规模`:' · 全部已披露') + (j.latestScaleDate?` · 规模截至 ${j.latestScaleDate}`:'');
+    meta.textContent = `${j.total.toLocaleString()} 只` + (j.missing?` · ${j.missing} 只未披露规模`:' · 全部已披露') + (j.latestScaleDate?` · 规模截至 ${j.latestScaleDate}`:'') + (j.snapshotAt?` · 网页版按季报快照汇总（${j.snapshotAt}）`:'');
     setTimeout(()=>{ if(!aggTimer) prog.style.display='none'; }, 1200);
   }
 }
 async function pollAgg(){
   const key = aggKeyCur;
   try{
-    const j = await api('/api/scale-agg?'+aggParams(), 30000);
+    const j = HOSTED && state.group!=='all'
+      ? await api('/api/scale-agg', 30000, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.assign(Object.fromEntries(aggParams()), {gcodes:groupCodes()}))})
+      : await api('/api/scale-agg?'+aggParams(), 30000);
     if(key!==aggKeyCur) return;
     renderAgg(j);
     if(j.running){ aggTimer = setTimeout(pollAgg, 2500); }
@@ -1427,13 +1506,13 @@ $('#refreshBtn').addEventListener('click',async()=>{
     await loadMeta(true);
     await loadFunds(true);
     await Promise.all([enrichToday(true), enrichDev(true), enrichExtras(true)]);
-    toast('刷新完成：净值/行情/估算/规模/费率均为最新真实数据','ok');
+    toast(HOSTED ? '刷新完成：净值/行情/估算/费率均为最新真实数据（规模为季报快照）' : '刷新完成：净值/行情/估算/规模/费率均为最新真实数据','ok');
   }catch(e){ netErr(e); }
   finally{ $('#refreshBtn').disabled=false; }
 });
 $('#downRetry').addEventListener('click',async()=>{
   try{ const h=await api('/api/health',5000); if(h.ok){ showDown(false); boot(); } }
-  catch(e){ toast('仍未连接上数据桥，请确认 启动.bat 黑窗口已开启','err'); }
+  catch(e){ toast(HOSTED ? '仍未连接上数据服务，请稍后重试' : '仍未连接上数据桥，请确认 启动.bat 黑窗口已开启','err'); }
 });
 
 /* ================= 启动 ================= */
@@ -1445,6 +1524,7 @@ function syncControls(){
   $('#autoTgl').classList.toggle('on',!!state.auto);
 }
 async function boot(){
+  if(HOSTED) applyHostedUI();
   syncControls();
   await loadUser();
   if(state.group!=='all' && state.group!=='watch' && !catById(state.group)){ state.group='all'; saveState(); }
@@ -1453,6 +1533,7 @@ async function boot(){
   await loadFunds(false);
 }
 window.__fundDebug = {
+  HOSTED, API,
   state, estMap, devMap, extMap, get user(){return USER;}, get rows(){return ROWS;}, get meta(){return META;},
   openFund, closeFund, loadFunds, enrichToday, enrichDev, enrichExtras,
   toggleWatch, toggleCatMember, createCat, setGroup, deleteCurrentCat, openCatPop, closeCatPop, openCatDlg, submitCatDlg, flushUser,

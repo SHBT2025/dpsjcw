@@ -7,3 +7,6 @@ server.log
 _shot.*
 _fee_test.html
 userdata.json
+dist/
+.qoder/
+*.qoder.site

@@ -45,9 +45,33 @@ server.js（零依赖本地桥，127.0.0.1:8788）
 
 ## 网页版
 
-部署于 Qoder Sites（静态前端 + Edge Function 数据桥）。网页版的规模聚合使用季报快照
-（`functions/scale_snapshot.json`，生成日期见文件内 `generatedAt`），其余数据实时请求；
-自选/分类存于浏览器本地。线上地址见仓库 About / 交付说明。
+线上地址：<https://dpsjcw-uf1u9pp1ptn.qoder.website>
+**访问范围：私有** —— 需用站点所有者的 Qoder 账号登录后才能打开（匿名访问返回 401 登录页）。
+
+部署于 Qoder Sites：静态前端 `dist/index.html` + 一个 Edge Function 数据桥（Deno 运行时）。
+
+```
+浏览器（同源）
+   │ /functions/v1/app/<接口>
+   ▼
+functions/index.ts → functions/handler.ts（server.js 的同口径移植）
+   │ fetch + 重试/备用主机轮换 + 内存缓存（TTL 同本地）+ inflight 去重 + 并发闸 6
+   ▼
+东财排行/移动接口/pingzhongdata/f10费率 · 腾讯行情与日K · 新浪A股备用
+```
+
+与本地版的差异（均为口径诚实处理，非功能缩水）：
+
+- 边缘运行时不能落盘：磁盘缓存改为**模块级内存缓存**，冷启动首次拉取全市场列表约需十几秒
+- 底部类目总规模改用**季报快照即时汇总**（`functions/scale_snapshot.json`，由本地真实缓存的
+  东财 `FundMNBasicInformation` 期末净资产汇总而成，含 `generatedAt` 汇总日期，界面底部如实标注）；
+  单只基金的规模/净值/行情/费率仍为真实请求
+- 自选与自定义分类存于**当前浏览器 localStorage**（键 `dpsj_user_v1`），不上传服务器；
+  分组筛选时由前端把分组代码随请求提交给云函数
+- 估算/偏离按小块（12 只 / 6 只）分批请求，避免边缘单次请求超时，先到先显示
+
+重新构建网页产物：`cp index.html dist/index.html`（前端为单文件，无构建步骤）。
+快照如需更新：在本地跑一段时间积累 `data_cache/basic_*.json` 后重新汇总生成。
 
 ## 口径与局限（诚实声明）
 
