@@ -217,6 +217,8 @@ const THEMES = [
   ['ne', '新能源光伏', /新能源|光伏|碳中和|电池|锂|风电|储能|绿色|环保/],
   ['semi', '半导体芯片', /半导体|芯片|集成电路/],
   ['tech', '科技AI', /科技|人工智能|算力|云计算|大数据|软件|计算机|通信|5G|互联网|数字经济|机器人|智能|电子|信息/],
+  ['robot', '人形机器人', /机器人|人形/],
+  ['aiapp', 'AI应用', /AI应用|人工智能应用|AIGC|创业AI|信创产业|信息技术应用创新|软件|传媒|游戏|影视|动漫|互联网/],
   ['mil', '军工', /军工|国防|航空航天|船舶/],
   ['fin', '金融地产', /金融|银行|证券|保险|地产|房地产|非银/],
   ['res', '资源周期', /有色|煤炭|钢铁|石油|化工|资源|材料|黄金|贵金属|矿业|农业|养殖|畜牧/],
@@ -775,8 +777,284 @@ async function fundDetail(code, days, fresh) {
   };
 }
 
+/* ---------- 高级搜索：按股票找持仓基金（真实季报前十大持仓，渐进扫描） ---------- */
+const STOCK_KEY_RE = /^(sh\d{6}|sz\d{6}|bj\d{6}|hk\d{5}|us[A-Z0-9]{1,6})$/;
+/* 持仓 ksym 与用户输入统一成同一把键：美股去掉交易所后缀（usNVDA.OQ → usNVDA） */
+function stockKey(ksym) {
+  const s = String(ksym || '').trim();
+  if (/^us/i.test(s)) return 'us' + s.slice(2).split('.')[0].toUpperCase();
+  return s.toLowerCase();
+}
+function normStockKey(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (/^(sh|sz|bj|hk|us)/i.test(s)) { const k = stockKey(s); return STOCK_KEY_RE.test(k) ? k : null; }
+  if (/^\d{6}$/.test(s)) { const c0 = s[0]; return ((c0 === '6' || c0 === '9') ? 'sh' : (c0 === '4' || c0 === '8' || s.startsWith('92')) ? 'bj' : 'sz') + s; }
+  if (/^\d{5}$/.test(s)) return 'hk' + s;
+  if (/^[A-Za-z]{1,6}(\.[A-Za-z]{1,2})?$/.test(s)) return 'us' + s.split('.')[0].toUpperCase();
+  return null;
+}
+function stockMeta(key) {
+  if (key.startsWith('hk')) return { mkt: 'HK', label: '港股', code: key.slice(2) };
+  if (key.startsWith('us')) return { mkt: 'US', label: '美股', code: key.slice(2) };
+  return { mkt: 'A', label: key.startsWith('sh') ? '沪A' : key.startsWith('bj') ? '北交所' : '深A', code: key.slice(2) };
+}
+/* 腾讯 smartbox（GBK + \u 转义）：GP 开头才是股票，排除指数/ETF/基金 */
+function parseSmartbox(buf) {
+  const raw = new TextDecoder('gbk').decode(buf);
+  const m = raw.match(/^[^=]*=\s*"([\s\S]*)"\s*;?\s*$/);
+  if (!m) return [];
+  let s;
+  try { s = JSON.parse('"' + m[1] + '"'); }
+  catch (e) { s = m[1].replace(/\\u([0-9a-fA-F]{4})/g, (x, g) => String.fromCharCode(parseInt(g, 16))); }
+  const out = [], seen = new Set();
+  for (const it of s.split('^')) {
+    const p = it.split('~');
+    if (p.length < 5) continue;
+    const mkt = p[0], code = p[1], name = p[2], py = p[3], type = p[4];
+    if (!/^GP/.test(type || '')) continue;
+    if (mkt === 'hk' && /^8/.test(code)) continue; // 港股人民币柜台，与季报持仓口径不同
+    let key = null;
+    if (mkt === 'sh' || mkt === 'sz' || mkt === 'bj') key = mkt + code;
+    else if (mkt === 'hk') key = 'hk' + code.padStart(5, '0');
+    else if (mkt === 'us') key = 'us' + code.split('.')[0].toUpperCase();
+    if (!key || !STOCK_KEY_RE.test(key) || seen.has(key)) continue;
+    seen.add(key);
+    out.push(Object.assign({ key, name, py: (py || '').toUpperCase() }, stockMeta(key)));
+  }
+  return out;
+}
+/* 东财 suggest 备用（部分网络返回 JSONP 包装，仅在含股票表时采用） */
+function parseEmSuggest(txt) {
+  let t = String(txt || '').trim();
+  if (!t.startsWith('{')) { const i = t.indexOf('('), j = t.lastIndexOf(')'); if (i < 0 || j < i) return []; t = t.slice(i + 1, j); }
+  let j; try { j = JSON.parse(t); } catch (e) { return []; }
+  const arr = (j && j.QuotationCodeTable && j.QuotationCodeTable.Data) || [];
+  const out = [], seen = new Set();
+  for (const d of arr) {
+    if (!d || !d.Code) continue;
+    let key = null;
+    if (d.Classify === 'AStock') key = normStockKey(d.Code);
+    else if (d.Classify === 'HK') key = 'hk' + String(d.Code).padStart(5, '0');
+    else if (d.Classify === 'UsStock') key = 'us' + String(d.Code).split('.')[0].toUpperCase();
+    if (!key || !STOCK_KEY_RE.test(key) || seen.has(key)) continue;
+    seen.add(key);
+    const meta = stockMeta(key);
+    out.push({ key, name: d.Name || '', py: (d.PinYin || '').toUpperCase(), mkt: meta.mkt, label: d.SecurityTypeName || meta.label, code: meta.code });
+  }
+  return out;
+}
+async function stockSuggest(q, fresh) {
+  q = String(q || '').trim();
+  if (!q) return [];
+  const ck = 'suggest_' + md5(q.toLowerCase());
+  const c = readCache(ck, TTL.search, fresh);
+  if (c) return c;
+  return dedup(ck, async () => {
+    let out = [];
+    try {
+      const b = await fetchRetry(['https://smartbox.gtimg.cn/s3/?v=2&q=' + encodeURIComponent(q) + '&t=all'], { Referer: 'https://gu.qq.com/' }, 2, 9000);
+      out = parseSmartbox(b);
+    } catch (e) { log('smartbox suggest fail:', e.message); }
+    if (!out.length) {
+      try {
+        const b = await fetchRetry(['https://searchapi.eastmoney.com/api/suggest/get?input=' + encodeURIComponent(q) + '&type=14&count=12'], { 'User-Agent': MOB_UA }, 2, 9000);
+        out = parseEmSuggest(b.toString('utf8'));
+      } catch (e) { log('em suggest fail:', e.message); }
+    }
+    out = out.slice(0, 12);
+    if (out.length) writeCache(ck, out);   // 空结果不缓存，下次仍发真实请求
+    return out;
+  });
+}
+
+const advJobs = new Map();
+let activeAdv = null, advGen = 0;
+function advKeyOf(keys) { return md5(keys.slice().sort().join(',')); }
+function advFile(key) { return path.join(CACHE_DIR, 'advjob_' + key + '.json'); }
+function advLoad(key) {
+  try { const j = JSON.parse(fs.readFileSync(advFile(key), 'utf8')); if (j && j.key === key && j.matches) return j; } catch (e) { /* 无历史进度 */ }
+  return null;
+}
+function advSave(job) {
+  try { fs.writeFileSync(advFile(job.key), JSON.stringify(Object.assign({}, job, { running: false }))); }
+  catch (e) { log('adv save fail', job.key, e.message); }
+}
+function advCounters(job) {
+  const matched = Object.keys(job.matches).length;
+  const failed = job.failedCodes.length;
+  const noHold = job.noHold;
+  return {
+    total: job.total, done: job.done, matched, noHold, failed,
+    miss: Math.max(job.done - matched - noHold - failed, 0),
+    unknown: Math.max(job.total - job.done, 0), matchTotal: matched
+  };
+}
+function advBase(code) {
+  const b0 = baseOf(code);
+  if (b0 && (b0.scaleYi !== undefined || b0.fee)) return b0;
+  const b = readCache('basic_' + code, TTL.basic, false);
+  const fe = readCache('fee_' + code, TTL.fee, false);
+  if (!b && !fe) return null;
+  return {
+    scaleYi: b && b.endNav !== null && b.endNav > 0 ? b.endNav / 1e8 : null,
+    scaleDate: b ? (b.scaleDate || '') : '',
+    fee: fe || (b && b.buy !== null && b.buy !== undefined ? { buy: b.buy, buyOrig: b.buyOrig === undefined ? null : b.buyOrig, buyTier: '', mgmt: null, custody: null, service: null } : null)
+  };
+}
+/* 命中数降序 → 合计占净值比降序 → 代码升序；分页后才读规模/费率缓存，避免每次轮询全盘 IO */
+function advRows(job, u, page, size) {
+  const arr = Object.keys(job.matches).map(code => ({ code, n: job.matches[code].n, wsum: job.matches[code].wsum }));
+  arr.sort((a, b) => b.n - a.n || b.wsum - a.wsum || (a.code < b.code ? -1 : 1));
+  const total = arr.length;
+  const rows = arr.slice((page - 1) * size, page * size).map(x => {
+    const m = job.matches[x.code], f = u.byCode.get(x.code);
+    if (!f) return null;
+    const o = {
+      code: x.code, name: f.name, type: f.type, tk: f.tk, themes: f.themes,
+      nav: f.nav, navDate: f.navDate, chg: f.chg, m1: f.m1, m3: f.m3, y1: f.y1,
+      n: m.n, wsum: m.wsum, items: m.items, holdDate: m.holdDate, cov: m.cov
+    };
+    const b = advBase(x.code);
+    if (b) {
+      if (b.scaleYi !== null && b.scaleYi !== undefined) { o.scaleYi = Math.round(b.scaleYi * 1e4) / 1e4; o.scaleDate = b.scaleDate; }
+      if (b.fee) o.fee = b.fee;
+    }
+    return o;
+  }).filter(Boolean);
+  return { rows, matchTotal: total };
+}
+function advDist(job) {
+  if (!job) return { dist: {}, mkt: { A: 0, HK: 0, US: 0 } };
+  const sig = job.done + ':' + Object.keys(job.matches).length;
+  if (job.distCache && job.distCache.sig === sig) return job.distCache;
+  const dist = {}, mkt = { A: 0, HK: 0, US: 0 };
+  for (const code of Object.keys(job.matches)) {
+    const m = job.matches[code];
+    dist[m.n] = (dist[m.n] || 0) + 1;
+    const seen = {};
+    for (const it of m.items) {
+      const k = it.key.startsWith('hk') ? 'HK' : it.key.startsWith('us') ? 'US' : 'A';
+      if (!seen[k]) { seen[k] = true; mkt[k]++; }
+    }
+  }
+  job.distCache = { sig, dist, mkt };
+  return job.distCache;
+}
+function advStatus(job, u, page, size) {
+  const base = Object.assign({
+    key: job ? job.key : '', stocks: job ? job.stocks : [], navDate: u.navDate,
+    total: u.funds.length, done: 0, matched: 0, noHold: 0, miss: 0, failed: 0, unknown: u.funds.length, matchTotal: 0,
+    running: job ? job.running : false, paused: job ? job.paused : false, idle: !job, pass: job ? job.pass : 1,
+    startedAt: job ? job.startedAt : 0, finishedAt: job ? (job.finishedAt || 0) : 0, error: job ? (job.error || '') : ''
+  }, job ? advCounters(job) : {});
+  const r = job ? advRows(job, u, page, size) : { rows: [], matchTotal: 0 };
+  const d = advDist(job);
+  return Object.assign(base, { page, size, rows: r.rows, matchTotal: r.matchTotal, dist: d.dist, mkt: d.mkt, holdNote: '命中口径=最新季报前十大重仓股（报告期见每行），调仓滞后属固有局限' });
+}
+async function advScanCtl(action, keys, page, size) {
+  const u = await ensureUniverse(false);
+  if (!keys.length) {
+    if (action === 'status') return advStatus(null, u, page, size);
+    throw Object.assign(new Error('请先添加至少一只股票（代码或名称）'), { status: 400 });
+  }
+  const key = advKeyOf(keys);
+  let job = advJobs.get(key) || advLoad(key);
+  if (action === 'status') return advStatus(job, u, page, size);
+  if (action === 'stop') {
+    if (job) { job.paused = true; job.cancel = true; job.running = false; advSave(job); }
+    return advStatus(job, u, page, size);
+  }
+  const allCodes = u.funds.map(f => f.code);
+  if (!job || action === 'restart') {
+    job = {
+      key, stocks: keys.slice(), codes: allCodes, total: allCodes.length, cursor: 0, pass: 1, done: 0,
+      matches: {}, noHold: 0, failedCodes: [], startedAt: Date.now(), finishedAt: 0,
+      running: true, paused: false, cancel: false, error: ''
+    };
+  } else {
+    if (!Array.isArray(job.codes) || !job.codes.length) { job.codes = allCodes; job.total = allCodes.length; }
+    job.stocks = keys.slice();
+    job.running = true; job.paused = false; job.cancel = false; job.error = '';
+  }
+  if (advJobs.size > 6) for (const k of advJobs.keys()) { if (k !== key) advJobs.delete(k); }
+  advJobs.set(key, job);
+  if (activeAdv && activeAdv !== job && activeAdv.running) { activeAdv.cancel = true; activeAdv.running = false; }
+  activeAdv = job;
+  const myGen = ++advGen;
+  const keySet = new Set(keys);
+  const finished = job.cursor >= job.codes.length && (job.pass >= 2 || !job.failedCodes.length);
+  if (!finished) {
+    job.finishedAt = 0;
+    (async () => {
+      let lastSave = 0;
+      while (advGen === myGen && !job.cancel && !job.paused) {
+        if (job.cursor >= job.codes.length) {
+          if (job.pass === 1 && job.failedCodes.length) {
+            job.pass = 2; job.codes = job.failedCodes.slice(); job.cursor = 0;
+            log('adv pass2 retry', job.key, job.codes.length);
+            continue;
+          }
+          break;
+        }
+        await scanYield();   // 交互请求优先
+        const batch = job.codes.slice(job.cursor, job.cursor + 12);
+        const rs = await Promise.all(batch.map(c => getHoldings(c, false).catch(e => ({ error: e.message }))));
+        for (let i = 0; i < batch.length; i++) {
+          const code = batch[i], h = rs[i];
+          const fi = job.failedCodes.indexOf(code);
+          if (h && !h.error && Array.isArray(h.stocks)) {
+            if (fi >= 0) job.failedCodes.splice(fi, 1);
+            if (job.pass === 1) job.done++;
+            if (!h.stocks.length) { job.noHold++; continue; }
+            const items = [], seen = new Set();
+            let wsum = 0;
+            for (const s of h.stocks) {
+              const k = stockKey(s.ksym);
+              if (!keySet.has(k) || seen.has(k)) continue;
+              seen.add(k); items.push({ key: k, name: s.name, w: s.w }); wsum += s.w;
+            }
+            if (items.length) job.matches[code] = { n: items.length, wsum: Math.round(wsum * 100) / 100, items, holdDate: h.date || '', cov: h.coverage };
+          } else {
+            if (fi < 0) job.failedCodes.push(code);
+            if (job.pass === 1) job.done++;
+          }
+        }
+        job.cursor += batch.length;
+        if (Date.now() - lastSave > 3000) { lastSave = Date.now(); advSave(job); }
+      }
+      if (advGen === myGen) {
+        job.running = false; job.paused = job.cancel; job.finishedAt = Date.now();
+        advSave(job);
+        log('adv scan done', job.key, Object.keys(job.matches).length, '/', job.total);
+      }
+    })().catch(e => { job.running = false; job.error = e.message; advSave(job); log('adv scan fail', e.message); });
+  } else { job.running = false; job.finishedAt = job.finishedAt || Date.now(); }
+  return advStatus(job, u, page, size);
+}
+
 /* ---------- 用户数据：自选 + 自定义分类（本机 userdata.json） ---------- */
 const USER_FILE = path.join(ROOT, 'userdata.json');
+function cleanSchemes(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const s of arr) {
+    if (!s || !s.id || !s.name) continue;
+    const stocks = (Array.isArray(s.stocks) ? s.stocks : []).map(x => {
+      const key = normStockKey(x && (x.key || x.code));
+      if (!key) return null;
+      return Object.assign({ key, name: String((x && x.name) || '').slice(0, 40) }, stockMeta(key));
+    }).filter(Boolean).slice(0, 30);
+    if (!stocks.length) continue;
+    out.push({
+      id: String(s.id).slice(0, 24), name: String(s.name).slice(0, 30), stocks,
+      savedAt: Number(s.savedAt) || Date.now(),
+      info: s.info && typeof s.info === 'object' ? { done: Number(s.info.done) || 0, total: Number(s.info.total) || 0, matched: Number(s.info.matched) || 0 } : null
+    });
+    if (out.length >= 60) break;
+  }
+  return out;
+}
 function loadUser() {
   try {
     const j = JSON.parse(fs.readFileSync(USER_FILE, 'utf8'));
@@ -785,9 +1063,10 @@ function loadUser() {
       cats: Array.isArray(j.cats) ? j.cats.filter(c => c && c.id && c.name).map(c => ({
         id: String(c.id).slice(0, 24), name: String(c.name).slice(0, 20),
         codes: Array.isArray(c.codes) ? c.codes.filter(x => /^\d{6}$/.test(x)) : []
-      })) : []
+      })) : [],
+      schemes: cleanSchemes(j.schemes)
     };
-  } catch (e) { return { watch: [], cats: [] }; }
+  } catch (e) { return { watch: [], cats: [], schemes: [] }; }
 }
 function saveUser(j) {
   const tmp = USER_FILE + '.tmp';
@@ -884,6 +1163,8 @@ function devStatus(type, theme, q, group, u) {
 }
 /* 交互请求优先：出站闸占满或有排队时扫描先让路，保证界面不卡 */
 async function scanYield() {
+  //  warm 缓存路径全是同步读+微任务，必须显式让出事件循环，否则轮询/交互请求会被整轮扫描饿死
+  await new Promise(r => setImmediate(r));
   let guard = 0;
   while ((gate.queue.length > 0 || gate.active >= gate.max) && guard++ < 150) await new Promise(r => setTimeout(r, 120));
 }
@@ -1020,6 +1301,33 @@ const server = http.createServer(async (req, res) => {
       });
       return sendJson(res, { total: list.length, page, size, navDate: univ.navDate, rows, sortInfo });
     }
+    if (p === '/api/stock-suggest') {
+      const q = (u.searchParams.get('q') || '').trim();
+      if (q.length > 40) return sendJson(res, { error: '搜索词过长（最多40字）' }, 400);
+      return sendJson(res, { q, items: await stockSuggest(q, u.searchParams.get('fresh') === '1') });
+    }
+    if (p === '/api/adv-scan') {
+      const sp2 = u.searchParams;
+      let action = sp2.get('action') || 'status';
+      let stocksRaw = sp2.get('stocks') || '';
+      let page = Math.max(parseInt(sp2.get('page')) || 1, 1);
+      let size = Math.min(Math.max(parseInt(sp2.get('size')) || 50, 10), 120);
+      if (req.method === 'POST') {
+        let b = '';
+        req.on('data', c => { b += c; if (b.length > 1e5) req.destroy(); });
+        await new Promise(r => req.on('end', r));
+        try {
+          const j = JSON.parse(b || '{}');
+          if (j.action) action = String(j.action);
+          if (j.stocks !== undefined) stocksRaw = Array.isArray(j.stocks) ? j.stocks.join(',') : String(j.stocks);
+          if (j.page) page = Math.max(parseInt(j.page) || 1, 1);
+          if (j.size) size = Math.min(Math.max(parseInt(j.size) || 50, 10), 120);
+        } catch (e) { return sendJson(res, { error: '请求体格式错误' }, 400); }
+      }
+      if (!['start', 'restart', 'stop', 'status'].includes(action)) return sendJson(res, { error: '未知扫描动作 ' + action }, 400);
+      const keys = [...new Set(String(stocksRaw).split(',').map(s => normStockKey(s)).filter(Boolean))].slice(0, 30);
+      return sendJson(res, await advScanCtl(action, keys, page, size));
+    }
     if (p === '/api/userdata') {
       if (req.method === 'GET') return sendJson(res, loadUser());
       if (req.method === 'PUT') {
@@ -1033,7 +1341,8 @@ const server = http.createServer(async (req, res) => {
               cats: (Array.isArray(j.cats) ? j.cats : []).slice(0, 100).filter(c => c && c.id && c.name).map(c => ({
                 id: String(c.id).slice(0, 24), name: String(c.name).slice(0, 20),
                 codes: [...new Set((Array.isArray(c.codes) ? c.codes : []).filter(x => /^\d{6}$/.test(x)))].slice(0, 5000)
-              }))
+              })),
+              schemes: cleanSchemes(j.schemes)
             };
             saveUser(clean);
             sendJson(res, { ok: true });

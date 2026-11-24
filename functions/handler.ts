@@ -129,6 +129,8 @@ const THEMES: [string, string, RegExp][] = [
   ['ne', '新能源光伏', /新能源|光伏|碳中和|电池|锂|风电|储能|绿色|环保/],
   ['semi', '半导体芯片', /半导体|芯片|集成电路/],
   ['tech', '科技AI', /科技|人工智能|算力|云计算|大数据|软件|计算机|通信|5G|互联网|数字经济|机器人|智能|电子|信息/],
+  ['robot', '人形机器人', /机器人|人形/],
+  ['aiapp', 'AI应用', /AI应用|人工智能应用|AIGC|创业AI|信创产业|信息技术应用创新|软件|传媒|游戏|影视|动漫|互联网/],
   ['mil', '军工', /军工|国防|航空航天|船舶/],
   ['fin', '金融地产', /金融|银行|证券|保险|地产|房地产|非银/],
   ['res', '资源周期', /有色|煤炭|钢铁|石油|化工|资源|材料|黄金|贵金属|矿业|农业|养殖|畜牧/],
@@ -831,6 +833,7 @@ async function devScanTick(job: DevJob, budgetMs: number) {
       } catch (e) { job.failed += batch.length; log('dev scan batch fail:', (e as Error).message); }
       job.done += batch.length;
       job.unknown = Math.max(job.total - job.done, 0);
+      await new Promise(r => setTimeout(r, 0)); // 让出事件循环，避免 warm 缓存微任务链饿死交互请求
     }
     job.running = false; job.finishedAt = Date.now();
     log('dev1 scan done', job.key, job.computed, '/', job.total);
@@ -874,6 +877,250 @@ async function devScanCtl(action: string, type: string | null, theme: string | n
   activeDev = job;
   if (job.running) await devScanTick(job, DEV_SCAN_BUDGET);
   return devStatus(job, list, u, type, theme, q, group, gcodes);
+}
+
+/* ---------- 高级搜索：按股票找持仓基金（真实季报前十大持仓，按请求预算渐进扫描） ---------- */
+const STOCK_KEY_RE = /^(sh\d{6}|sz\d{6}|bj\d{6}|hk\d{5}|us[A-Z0-9]{1,6})$/;
+function stockKey(ksym: unknown) {
+  const s = String(ksym || '').trim();
+  if (/^us/i.test(s)) return 'us' + s.slice(2).split('.')[0].toUpperCase();
+  return s.toLowerCase();
+}
+function normStockKey(raw: unknown): string | null {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (/^(sh|sz|bj|hk|us)/i.test(s)) { const k = stockKey(s); return STOCK_KEY_RE.test(k) ? k : null; }
+  if (/^\d{6}$/.test(s)) { const c0 = s[0]; return ((c0 === '6' || c0 === '9') ? 'sh' : (c0 === '4' || c0 === '8' || s.startsWith('92')) ? 'bj' : 'sz') + s; }
+  if (/^\d{5}$/.test(s)) return 'hk' + s;
+  if (/^[A-Za-z]{1,6}(\.[A-Za-z]{1,2})?$/.test(s)) return 'us' + s.split('.')[0].toUpperCase();
+  return null;
+}
+function stockMeta(key: string) {
+  if (key.startsWith('hk')) return { mkt: 'HK', label: '港股', code: key.slice(2) };
+  if (key.startsWith('us')) return { mkt: 'US', label: '美股', code: key.slice(2) };
+  return { mkt: 'A', label: key.startsWith('sh') ? '沪A' : key.startsWith('bj') ? '北交所' : '深A', code: key.slice(2) };
+}
+type SuggestItem = { key: string; name: string; py: string; mkt: string; label: string; code: string };
+function parseSmartbox(buf: Uint8Array): SuggestItem[] {
+  const raw = new TextDecoder('gbk').decode(buf);
+  const m = raw.match(/^[^=]*=\s*"([\s\S]*)"\s*;?\s*$/);
+  if (!m) return [];
+  let s: string;
+  try { s = JSON.parse('"' + m[1] + '"'); }
+  catch (_e) { s = m[1].replace(/\\u([0-9a-fA-F]{4})/g, (_x, g) => String.fromCharCode(parseInt(g, 16))); }
+  const out: SuggestItem[] = [], seen = new Set<string>();
+  for (const it of s.split('^')) {
+    const p = it.split('~');
+    if (p.length < 5) continue;
+    const mkt = p[0], code = p[1], name = p[2], py = p[3], type = p[4];
+    if (!/^GP/.test(type || '')) continue;
+    if (mkt === 'hk' && /^8/.test(code)) continue;
+    let key: string | null = null;
+    if (mkt === 'sh' || mkt === 'sz' || mkt === 'bj') key = mkt + code;
+    else if (mkt === 'hk') key = 'hk' + code.padStart(5, '0');
+    else if (mkt === 'us') key = 'us' + code.split('.')[0].toUpperCase();
+    if (!key || !STOCK_KEY_RE.test(key) || seen.has(key)) continue;
+    seen.add(key);
+    out.push(Object.assign({ key, name, py: (py || '').toUpperCase() }, stockMeta(key)));
+  }
+  return out;
+}
+function parseEmSuggest(txt: string): SuggestItem[] {
+  let t = String(txt || '').trim();
+  if (!t.startsWith('{')) { const i = t.indexOf('('), j = t.lastIndexOf(')'); if (i < 0 || j < i) return []; t = t.slice(i + 1, j); }
+  let j: any; try { j = JSON.parse(t); } catch (_e) { return []; }
+  const arr = (j && j.QuotationCodeTable && j.QuotationCodeTable.Data) || [];
+  const out: SuggestItem[] = [], seen = new Set<string>();
+  for (const d of arr) {
+    if (!d || !d.Code) continue;
+    let key: string | null = null;
+    if (d.Classify === 'AStock') key = normStockKey(d.Code);
+    else if (d.Classify === 'HK') key = 'hk' + String(d.Code).padStart(5, '0');
+    else if (d.Classify === 'UsStock') key = 'us' + String(d.Code).split('.')[0].toUpperCase();
+    if (!key || !STOCK_KEY_RE.test(key) || seen.has(key)) continue;
+    seen.add(key);
+    const meta = stockMeta(key);
+    out.push({ key, name: d.Name || '', py: (d.PinYin || '').toUpperCase(), mkt: meta.mkt, label: d.SecurityTypeName || meta.label, code: meta.code });
+  }
+  return out;
+}
+async function stockSuggest(q: string, fresh?: boolean): Promise<SuggestItem[]> {
+  q = String(q || '').trim();
+  if (!q) return [];
+  const ck = 'suggest_' + hash(q.toLowerCase());
+  const c = readCache<SuggestItem[]>(ck, TTL.search, fresh);
+  if (c) return c;
+  return dedup(ck, async () => {
+    let out: SuggestItem[] = [];
+    try {
+      out = parseSmartbox(await fetchRetry(['https://smartbox.gtimg.cn/s3/?v=2&q=' + encodeURIComponent(q) + '&t=all'], { Referer: 'https://gu.qq.com/' }, 2, 9000));
+    } catch (e) { log('smartbox suggest fail:', (e as Error).message); }
+    if (!out.length) {
+      try {
+        out = parseEmSuggest(utf8(await fetchRetry(['https://searchapi.eastmoney.com/api/suggest/get?input=' + encodeURIComponent(q) + '&type=14&count=12'], { 'User-Agent': MOB_UA }, 2, 9000)));
+      } catch (e) { log('em suggest fail:', (e as Error).message); }
+    }
+    out = out.slice(0, 12);
+    if (out.length) writeCache(ck, out);
+    return out;
+  });
+}
+
+type AdvMatch = { n: number; wsum: number; items: { key: string; name: string; w: number }[]; holdDate: string; cov: number };
+type AdvJob = {
+  key: string; stocks: string[]; codes: string[]; total: number; cursor: number; pass: number; done: number;
+  matches: Record<string, AdvMatch>; noHold: number; failedCodes: string[];
+  startedAt: number; finishedAt?: number; running: boolean; paused: boolean; cancel: boolean; ticking: boolean; error?: string;
+  distCache?: { sig: string; dist: Record<number, number>; mkt: Record<string, number> };
+};
+const advJobs = new Map<string, AdvJob>();
+let activeAdv: AdvJob | null = null;
+const ADV_SCAN_BUDGET = 2500; // 单次轮询的扫描预算：保证进度条秒级刷新，其余时间留给交互请求
+function advKeyOf(keys: string[]) { return hash(keys.slice().sort().join(',')); }
+function advCounters(job: AdvJob) {
+  const matched = Object.keys(job.matches).length;
+  const failed = job.failedCodes.length;
+  return {
+    total: job.total, done: job.done, matched, noHold: job.noHold, failed,
+    miss: Math.max(job.done - matched - job.noHold - failed, 0),
+    unknown: Math.max(job.total - job.done, 0), matchTotal: matched
+  };
+}
+function advRows(job: AdvJob, u: Univ, page: number, size: number) {
+  const arr = Object.keys(job.matches).map(code => ({ code, n: job.matches[code].n, wsum: job.matches[code].wsum }));
+  arr.sort((a, b) => b.n - a.n || b.wsum - a.wsum || (a.code < b.code ? -1 : 1));
+  const rows = arr.slice((page - 1) * size, page * size).map(x => {
+    const m = job.matches[x.code], f = u.byCode.get(x.code);
+    if (!f) return null;
+    const o: Record<string, unknown> = {
+      code: x.code, name: f.name, type: f.type, tk: f.tk, themes: f.themes,
+      nav: f.nav, navDate: f.navDate, chg: f.chg, m1: f.m1, m3: f.m3, y1: f.y1,
+      n: m.n, wsum: m.wsum, items: m.items, holdDate: m.holdDate, cov: m.cov
+    };
+    const b = baseOf(x.code);
+    if (b) {
+      if (b.scaleYi !== null && b.scaleYi !== undefined) { o.scaleYi = Math.round(b.scaleYi * 1e4) / 1e4; o.scaleDate = b.scaleDate; }
+      if (b.fee) o.fee = b.fee;
+    }
+    return o;
+  }).filter(Boolean);
+  return { rows, matchTotal: arr.length };
+}
+function advDist(job: AdvJob | null) {
+  if (!job) return { dist: {} as Record<number, number>, mkt: { A: 0, HK: 0, US: 0 } as Record<string, number> };
+  const sig = job.done + ':' + Object.keys(job.matches).length;
+  if (job.distCache && job.distCache.sig === sig) return job.distCache;
+  const dist: Record<number, number> = {}, mkt: Record<string, number> = { A: 0, HK: 0, US: 0 };
+  for (const code of Object.keys(job.matches)) {
+    const m = job.matches[code];
+    dist[m.n] = (dist[m.n] || 0) + 1;
+    const seen: Record<string, boolean> = {};
+    for (const it of m.items) {
+      const k = it.key.startsWith('hk') ? 'HK' : it.key.startsWith('us') ? 'US' : 'A';
+      if (!seen[k]) { seen[k] = true; mkt[k]++; }
+    }
+  }
+  job.distCache = { sig, dist, mkt };
+  return job.distCache;
+}
+function advStatus(job: AdvJob | null, u: Univ, page: number, size: number) {
+  const base: Record<string, unknown> = Object.assign({
+    key: job ? job.key : '', stocks: job ? job.stocks : [], navDate: u.navDate,
+    total: u.funds.length, done: 0, matched: 0, noHold: 0, miss: 0, failed: 0, unknown: u.funds.length, matchTotal: 0,
+    running: job ? job.running : false, paused: job ? job.paused : false, idle: !job, pass: job ? job.pass : 1,
+    startedAt: job ? job.startedAt : 0, finishedAt: job ? (job.finishedAt || 0) : 0, error: job ? (job.error || '') : ''
+  }, job ? advCounters(job) : {});
+  const r = job ? advRows(job, u, page, size) : { rows: [], matchTotal: 0 };
+  const d = advDist(job);
+  return Object.assign(base, {
+    page, size, rows: r.rows, matchTotal: r.matchTotal, dist: d.dist, mkt: d.mkt,
+    holdNote: '命中口径=最新季报前十大重仓股（报告期见每行），调仓滞后属固有局限',
+    edgeNote: '网页版扫描进度存于云端实例内存，实例回收后需继续扫描'
+  });
+}
+async function advScanTick(job: AdvJob, budgetMs: number) {
+  if (job.ticking) return;
+  job.ticking = true;
+  const deadline = Date.now() + budgetMs;
+  const keySet = new Set(job.stocks);
+  try {
+    while (job.cursor < job.codes.length) {
+      if (job.cancel || job.paused) { job.running = false; return; }
+      if (Date.now() > deadline) return;   // 预算用尽：保持 running，下一次轮询继续
+      const batch = job.codes.slice(job.cursor, job.cursor + 12);
+      job.cursor += batch.length;
+      const rs = await Promise.all(batch.map(c => getHoldings(c, false).catch(e => ({ error: (e as Error).message }))));
+      for (let i = 0; i < batch.length; i++) {
+        const code = batch[i], h = rs[i] as Hold & { error?: string };
+        const fi = job.failedCodes.indexOf(code);
+        if (h && !h.error && Array.isArray(h.stocks)) {
+          if (fi >= 0) job.failedCodes.splice(fi, 1);
+          if (job.pass === 1) job.done++;
+          if (!h.stocks.length) { job.noHold++; continue; }
+          const items: { key: string; name: string; w: number }[] = [], seen = new Set<string>();
+          let wsum = 0;
+          for (const s of h.stocks) {
+            const k = stockKey(s.ksym);
+            if (!keySet.has(k) || seen.has(k)) continue;
+            seen.add(k); items.push({ key: k, name: s.name, w: s.w }); wsum += s.w;
+          }
+          if (items.length) job.matches[code] = { n: items.length, wsum: Math.round(wsum * 100) / 100, items, holdDate: h.date || '', cov: h.coverage };
+        } else {
+          if (fi < 0) job.failedCodes.push(code);
+          if (job.pass === 1) job.done++;
+        }
+      }
+      // 让出事件循环：warm 内存缓存路径为同步微任务链，不让路会饿死同实例的其他请求
+      await new Promise(r => setTimeout(r, 0));
+    }
+    if (job.pass === 1 && job.failedCodes.length) {
+      job.pass = 2; job.codes = job.failedCodes.slice(); job.cursor = 0;
+      log('adv pass2 retry', job.key, job.codes.length);
+      return;
+    }
+    job.running = false; job.finishedAt = Date.now();
+    log('adv scan done', job.key, Object.keys(job.matches).length, '/', job.total);
+  } catch (e) { job.running = false; job.error = (e as Error).message; }
+  finally { job.ticking = false; }
+}
+async function advScanCtl(action: string, keys: string[], page: number, size: number) {
+  const u = await ensureUniverse(false);
+  if (!keys.length) {
+    if (action === 'status') return advStatus(null, u, page, size);
+    throw Object.assign(new Error('请先添加至少一只股票（代码或名称）'), { status: 400 });
+  }
+  const key = advKeyOf(keys);
+  let job = advJobs.get(key) || null;
+  if (action === 'status') {
+    if (job && job.running && !job.paused) await advScanTick(job, ADV_SCAN_BUDGET);
+    // 并发 start/restart 可能已替换同 key 的任务对象：响应必须反映当前任务，否则前端会误停轮询
+    job = advJobs.get(key) || job;
+    return advStatus(job, u, page, size);
+  }
+  if (action === 'stop') {
+    if (job) { job.paused = true; job.cancel = true; job.running = false; }
+    return advStatus(job, u, page, size);
+  }
+  const allCodes = u.funds.map(f => f.code);
+  if (!job || action === 'restart') {
+    job = {
+      key, stocks: keys.slice(), codes: allCodes, total: allCodes.length, cursor: 0, pass: 1, done: 0,
+      matches: {}, noHold: 0, failedCodes: [], startedAt: Date.now(), finishedAt: 0,
+      running: true, paused: false, cancel: false, ticking: false, error: ''
+    };
+  } else {
+    if (!job.codes.length) { job.codes = allCodes; job.total = allCodes.length; }
+    job.stocks = keys.slice();
+    job.running = true; job.paused = false; job.cancel = false; job.error = '';
+  }
+  if (advJobs.size > 4) for (const k of advJobs.keys()) { if (k !== key) advJobs.delete(k); }
+  advJobs.set(key, job);
+  if (activeAdv && activeAdv !== job && activeAdv.running) { activeAdv.cancel = true; activeAdv.running = false; }
+  activeAdv = job;
+  const finished = job.cursor >= job.codes.length && (job.pass >= 2 || !job.failedCodes.length);
+  if (finished) { job.running = false; job.finishedAt = job.finishedAt || Date.now(); }
+  else { job.finishedAt = 0; await advScanTick(job, ADV_SCAN_BUDGET); }
+  return advStatus(job, u, page, size);
 }
 
 /* ---------- HTTP ---------- */
@@ -1015,6 +1262,20 @@ export async function handler(req: Request): Promise<Response> {
       const action = get('action') || 'status';
       if (!['start', 'stop', 'status'].includes(action)) return sendJson({ error: '未知扫描动作 ' + action }, 400);
       return sendJson(await devScanCtl(action, get('type'), get('theme'), get('q'), group, gcodes));
+    }
+    if (p === '/stock-suggest') {
+      const q = (get('q') || '').trim();
+      if (q.length > 40) return sendJson({ error: '搜索词过长（最多40字）' }, 400);
+      return sendJson({ q, items: await stockSuggest(q, fresh) });
+    }
+    if (p === '/adv-scan') {
+      const action = get('action') || 'status';
+      if (!['start', 'restart', 'stop', 'status'].includes(action)) return sendJson({ error: '未知扫描动作 ' + action }, 400);
+      const raw = Array.isArray(body.stocks) ? body.stocks.join(',') : (get('stocks') || '');
+      const keys = [...new Set(String(raw).split(',').map(s => normStockKey(s)).filter(Boolean) as string[])].slice(0, 30);
+      const page = Math.max(parseInt(String(get('page'))) || 1, 1);
+      const size = Math.min(Math.max(parseInt(String(get('size'))) || 50, 10), 120);
+      return sendJson(await advScanCtl(action, keys, page, size));
     }
     return sendJson({ error: '未知接口 ' + p }, 404);
   } catch (e) {
